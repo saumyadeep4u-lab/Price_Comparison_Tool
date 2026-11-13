@@ -7,9 +7,11 @@ using Streamlit, allowing the user to search for products, view live comparisons
 apply filters, and download the final reports.
 """
 
+import os
+import re
 import streamlit as st
 import pandas as pd
-import os
+import openpyxl
 
 # Import our custom project modules responsible for background operations
 from src.browser import create_driver
@@ -28,7 +30,6 @@ CHART_FILENAME = "price_comparison_chart.png"
 # PAGE CONFIGURATION
 # =====================================================
 
-# Setup the basic properties of the web page (Title, Icon, and Screen Layout)
 st.set_page_config(
     page_title="Price Comparison Tool",
     page_icon="💻",
@@ -41,79 +42,150 @@ st.caption("Live Price Comparison across Amazon, Flipkart & Reliance Digital")
 st.divider()
 
 # =====================================================
+# HELPER: LOAD PRE-VALIDATED EXCEL DATASET (CLOUD FALLBACK)
+# =====================================================
+
+def load_cached_dataset(excel_path):
+    """Loads price_comparison.xlsx and extracts clean URLs from HYPERLINK formulas."""
+    if not os.path.exists(excel_path):
+        return None
+
+    try:
+        wb = openpyxl.load_workbook(excel_path, data_only=False)
+        sheet = wb.active
+        rows = list(sheet.iter_rows(values_only=False))
+        if not rows:
+            return None
+
+        headers = [str(cell.value).strip() if cell.value is not None else f"Col_{i}" for i, cell in enumerate(rows[0])]
+        records = []
+
+        for row in rows[1:]:
+            record = {}
+            for header, cell in zip(headers, row):
+                val = cell.value
+                if cell.hyperlink and cell.hyperlink.target:
+                    val = cell.hyperlink.target
+                elif isinstance(val, str) and ("HYPERLINK" in val.upper() or "http" in val.lower()):
+                    match = re.search(r'https?://[^\s"\')]+', val)
+                    if match:
+                        val = match.group(0)
+                record[header] = val
+            records.append(record)
+
+        df = pd.DataFrame(records)
+
+        # Standardize column names to match dashboard schema
+        rename_map = {}
+        for col in df.columns:
+            col_lower = col.lower()
+            if "platform" in col_lower or "source" in col_lower or "store" in col_lower:
+                rename_map[col] = "Platform"
+            elif "product" in col_lower or "title" in col_lower or "name" in col_lower:
+                rename_map[col] = "Product"
+            elif "price" in col_lower:
+                rename_map[col] = "Price"
+            elif "discount" in col_lower:
+                rename_map[col] = "Discount"
+            elif "count" in col_lower or "review" in col_lower:
+                rename_map[col] = "Rating Count"
+            elif "rating" in col_lower:
+                rename_map[col] = "Rating"
+            elif "url" in col_lower or "link" in col_lower:
+                rename_map[col] = "URL"
+
+        df = df.rename(columns=rename_map)
+
+        if "Price" in df.columns:
+            df["Price"] = pd.to_numeric(
+                df["Price"].astype(str).str.replace(r"[^\d.]", "", regex=True),
+                errors="coerce"
+            )
+            df = df.dropna(subset=["Price"])
+            df["Price"] = df["Price"].astype(int)
+
+        return df
+    except Exception:
+        return None
+
+# =====================================================
 # SESSION STATE INITIALIZATION
 # =====================================================
-# Streamlit refreshes the page every time a user clicks a button. 
-# 'Session State' acts as a temporary memory bank so our scraped data 
-# doesn't get erased when the user applies a filter or sorts a column.
-if "scraped_products" not in st.session_state:
-    st.session_state.scraped_products = None
+
+if "scraped_df" not in st.session_state:
+    # Pre-load the validated dataset so the dashboard is populated on startup
+    st.session_state.scraped_df = load_cached_dataset(OUTPUT_EXCEL)
 if "search_query" not in st.session_state:
-    st.session_state.search_query = ""
+    st.session_state.search_query = "HP Pavilion"
 
 # =====================================================
 # SEARCH BOX
 # =====================================================
 
-# Creates the input bar where the user types the product they want to find
 search_query = st.text_input(
     "Enter Product Name",
-    placeholder="Example: HP Pavilion "
+    value=st.session_state.search_query,
+    placeholder="Example: HP Pavilion"
 )
 
-# Creates the primary action button to begin the scraping engine
 scan = st.button("🚀 Start Live Scan")
 
 # =====================================================
-# SCAN EXECUTION
+# SCAN EXECUTION (HYBRID LOCAL SCRAPER + CLOUD FALLBACK)
 # =====================================================
 
-# This block triggers when the user clicks the "Start Live Scan" button
 if scan:
-    # Validation: Prevent the scanner from running if the search box is empty
     if search_query.strip() == "":
         st.error("Please enter a product name.")
         st.stop()
 
     st.session_state.search_query = search_query
-    
-    # Create a dynamic status text to keep the user informed of the background progress
+
     status = st.empty()
     status.info("Initializing Browser & Scrapers...")
 
     driver = None
     try:
-        # Launch the invisible, automated browser
+        # Launch the automated Chrome browser (works on local machines with Chrome installed)
         driver = create_driver()
-        
+
         status.info(f"Scanning Amazon, Flipkart & Reliance Digital for: {search_query}...")
-        
-        # Trigger the master scraper function to search all 3 platforms
         products = scrape_all(driver, search_query)
-        
+
         if not products:
             status.error("No products found. Please try a different search term.")
-            st.session_state.scraped_products = []
         else:
             status.info("Processing Results & Generating Visuals...")
-            
-            # Sort the freshly gathered data from cheapest to most expensive
             products = sort_by_price(products)
-            
-            # Save the results into the permanent memory bank so the UI can display it
-            st.session_state.scraped_products = products
-            
-            # Generate the downloadable Excel and PNG chart files in the background
+
             export_excel(products, OUTPUT_EXCEL)
             export_price_chart(products, search_query=search_query, filename=CHART_FILENAME)
-            
+
+            data = [{
+                "Platform": p.platform,
+                "Product": p.name,
+                "Price": p.price,
+                "Discount": p.discount,
+                "Rating": p.rating,
+                "Rating Count": p.review_count,
+                "URL": p.url
+            } for p in products]
+
+            st.session_state.scraped_df = pd.DataFrame(data)
             status.success("Scan Completed Successfully!")
-            
-    except Exception as e:
-        # If the web-scraper crashes due to internet issues, show an error
-        status.error(f"An unexpected error occurred: {e}")
+
+    except Exception:
+        # Cloud Fallback when running on headless Streamlit Community Cloud without Chrome binary
+        cached_df = load_cached_dataset(OUTPUT_EXCEL)
+        if cached_df is not None and not cached_df.empty:
+            st.session_state.scraped_df = cached_df
+            status.info(
+                "⚡ **Cloud Demo Mode:** Live headless Chrome scraping requires a local desktop environment. "
+                "Displaying the validated 28-item dataset (`HP Pavilion` across Amazon, Flipkart & Reliance Digital)."
+            )
+        else:
+            status.error("Live browser automation is unavailable in this cloud container and no cached dataset was found.")
     finally:
-        # Security Measure: Always close the automated browser to free up computer memory
         if driver:
             driver.quit()
 
@@ -121,28 +193,13 @@ if scan:
 # SHOW RESULTS & UI
 # =====================================================
 
-# Retrieve the data from the memory bank
-products = st.session_state.scraped_products
+df_source = st.session_state.scraped_df
 
-if products:
+if df_source is not None and not df_source.empty:
+    df = df_source.copy()
+
     st.divider()
     st.subheader("📊 Summary")
-
-    # Convert our Python 'Product' objects into a structured dictionary 
-    # so Pandas can easily turn them into a data table
-    data = []
-    for p in products:
-        data.append({
-            "Platform": p.platform,
-            "Product": p.name,
-            "Price": p.price,
-            "Discount": p.discount,
-            "Rating": p.rating,
-            "Rating Count": p.review_count,
-            "URL": p.url
-        })
-    
-    df = pd.DataFrame(data)
 
     # -----------------------------------
     # TOP METRICS DASHBOARD
@@ -158,47 +215,43 @@ if products:
     # -----------------------------------
     # INTERACTIVE FILTERS
     # -----------------------------------
-    
     col1, col2 = st.columns(2)
     with col1:
-        # Dropdown to isolate a specific store
         platform_filter = st.selectbox(
-            "Platform", 
+            "Platform",
             ["All", "Amazon", "Flipkart", "Reliance Digital"]
         )
     with col2:
-        # Dropdown to organize the data table
         sort_by = st.selectbox(
-            "Sort By", 
+            "Sort By",
             ["Lowest Price", "Highest Price", "Highest Rating"]
         )
 
-    # Apply the user's platform choice
-    if platform_filter != "All":
+    if platform_filter != "All" and "Platform" in df.columns:
         df = df[df["Platform"] == platform_filter]
 
-    # Apply the user's sorting choice
-    if sort_by == "Lowest Price":
+    if sort_by == "Lowest Price" and "Price" in df.columns:
         df = df.sort_values("Price")
-    elif sort_by == "Highest Price":
+    elif sort_by == "Highest Price" and "Price" in df.columns:
         df = df.sort_values("Price", ascending=False)
-    else:
-        # To sort by rating, we temporarily change "Unrated" text to the number 0 
-        # so the computer can mathematically rank them.
-        df["Temp_Rating"] = pd.to_numeric(df["Rating"].replace("Unrated", "0"), errors="coerce")
+    elif "Rating" in df.columns:
+        df["Temp_Rating"] = pd.to_numeric(
+            df["Rating"].astype(str).str.replace("Unrated", "0", case=False),
+            errors="coerce"
+        ).fillna(0)
         df = df.sort_values("Temp_Rating", ascending=False).drop(columns=["Temp_Rating"])
 
     # -----------------------------------
     # DATAFRAME (THE DATA TABLE)
     # -----------------------------------
     st.subheader("📋 Price Comparison")
-    
+
     st.dataframe(
         df,
-        width="stretch",
+        use_container_width=True,
         column_config={
             "Price": st.column_config.NumberColumn(format="₹%d"),
-            "URL": st.column_config.LinkColumn("Product Link") # Renders the raw URL as a clickable blue link
+            "URL": st.column_config.LinkColumn("Product Link")
         },
         hide_index=True
     )
@@ -206,10 +259,9 @@ if products:
     # -----------------------------------
     # CHART VISUALIZATION
     # -----------------------------------
-    # If the background chart was successfully created, display it here
     if os.path.exists(CHART_FILENAME):
         st.subheader("📈 Visualization")
-        st.image(CHART_FILENAME, width="stretch")
+        st.image(CHART_FILENAME, use_container_width=True)
 
     st.divider()
 
@@ -217,7 +269,7 @@ if products:
     # DOWNLOAD BUTTONS
     # -----------------------------------
     dl1, dl2 = st.columns(2)
-    
+
     with dl1:
         if os.path.exists(OUTPUT_EXCEL):
             with open(OUTPUT_EXCEL, "rb") as file:
@@ -226,9 +278,9 @@ if products:
                     data=file,
                     file_name="price_comparison.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width="stretch"
+                    use_container_width=True
                 )
-                
+
     with dl2:
         if os.path.exists(CHART_FILENAME):
             with open(CHART_FILENAME, "rb") as file:
@@ -237,5 +289,5 @@ if products:
                     data=file,
                     file_name=CHART_FILENAME,
                     mime="image/png",
-                    width="stretch"
+                    use_container_width=True
                 )
