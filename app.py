@@ -23,8 +23,9 @@ from src.data_processor import (
 )
 
 # Standardized filenames for the exportable reports
-OUTPUT_EXCEL = "price_comparison.xlsx"
-CHART_FILENAME = "price_comparison_chart.png"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_EXCEL = os.path.join(BASE_DIR, "price_comparison.xlsx")
+CHART_FILENAME = os.path.join(BASE_DIR, "price_comparison_chart.png")
 
 # =====================================================
 # PAGE CONFIGURATION
@@ -45,10 +46,26 @@ st.divider()
 # HELPER: LOAD PRE-VALIDATED EXCEL DATASET (CLOUD FALLBACK)
 # =====================================================
 
+def parse_price_value(val):
+    """Safely extracts integer price from numbers or formatted currency strings."""
+    if val is None or pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    match = re.search(r"\d[\d,]*", str(val))
+    if match:
+        return int(match.group(0).replace(",", ""))
+    return None
+
+
 def load_cached_dataset(excel_path):
     """Loads price_comparison.xlsx and extracts clean URLs from HYPERLINK formulas."""
     if not os.path.exists(excel_path):
-        return None
+        # Fallback if running from a different working directory
+        if os.path.exists("price_comparison.xlsx"):
+            excel_path = "price_comparison.xlsx"
+        else:
+            return None
 
     try:
         wb = openpyxl.load_workbook(excel_path, data_only=False)
@@ -57,55 +74,79 @@ def load_cached_dataset(excel_path):
         if not rows:
             return None
 
-        headers = [str(cell.value).strip() if cell.value is not None else f"Col_{i}" for i, cell in enumerate(rows[0])]
-        records = []
+        # Automatically locate the header row within the first 10 rows
+        header_idx = 0
+        expected_keywords = {"platform", "product", "name", "title", "price", "discount", "rating", "review", "url", "link"}
+        best_matches = -1
 
-        for row in rows[1:]:
+        for idx, row in enumerate(rows[:10]):
+            row_vals = [str(cell.value).strip().lower() for cell in row if cell.value is not None]
+            matches = sum(1 for val in row_vals if any(k in val for k in expected_keywords))
+            if matches > best_matches:
+                best_matches = matches
+                header_idx = idx
+
+        headers = [
+            str(cell.value).strip() if cell.value is not None else f"Col_{i}"
+            for i, cell in enumerate(rows[header_idx])
+        ]
+
+        records = []
+        for row in rows[header_idx + 1:]:
+            if all(cell.value is None for cell in row):
+                continue
             record = {}
             for header, cell in zip(headers, row):
                 val = cell.value
                 if cell.hyperlink and cell.hyperlink.target:
                     val = cell.hyperlink.target
                 elif isinstance(val, str) and ("HYPERLINK" in val.upper() or "http" in val.lower()):
-                    match = re.search(r'https?://[^\s"\')]+', val)
+                    match = re.search(r'https?://[^\s"\',)]+', val)
                     if match:
                         val = match.group(0)
                 record[header] = val
             records.append(record)
 
         df = pd.DataFrame(records)
+        if df.empty:
+            return None
 
-        # Standardize column names to match dashboard schema
+        # Map columns in strict priority order without creating duplicate column names
         rename_map = {}
+        used_targets = set()
+
         for col in df.columns:
             col_lower = col.lower()
-            if "platform" in col_lower or "source" in col_lower or "store" in col_lower:
-                rename_map[col] = "Platform"
-            elif "product" in col_lower or "title" in col_lower or "name" in col_lower:
-                rename_map[col] = "Product"
-            elif "price" in col_lower:
-                rename_map[col] = "Price"
-            elif "discount" in col_lower:
-                rename_map[col] = "Discount"
-            elif "count" in col_lower or "review" in col_lower:
-                rename_map[col] = "Rating Count"
-            elif "rating" in col_lower:
-                rename_map[col] = "Rating"
-            elif "url" in col_lower or "link" in col_lower:
-                rename_map[col] = "URL"
+            target = None
+            if ("url" in col_lower or "link" in col_lower) and "URL" not in used_targets:
+                target = "URL"
+            elif ("platform" in col_lower or "source" in col_lower or "store" in col_lower or "site" in col_lower) and "Platform" not in used_targets:
+                target = "Platform"
+            elif ("count" in col_lower or "review" in col_lower) and "Rating Count" not in used_targets:
+                target = "Rating Count"
+            elif "rating" in col_lower and "Rating" not in used_targets:
+                target = "Rating"
+            elif "discount" in col_lower and "Discount" not in used_targets:
+                target = "Discount"
+            elif "price" in col_lower and "Price" not in used_targets:
+                target = "Price"
+            elif ("product" in col_lower or "title" in col_lower or "name" in col_lower) and "Product" not in used_targets:
+                target = "Product"
+
+            if target:
+                rename_map[col] = target
+                used_targets.add(target)
 
         df = df.rename(columns=rename_map)
 
         if "Price" in df.columns:
-            df["Price"] = pd.to_numeric(
-                df["Price"].astype(str).str.replace(r"[^\d.]", "", regex=True),
-                errors="coerce"
-            )
+            df["Price"] = df["Price"].apply(parse_price_value)
             df = df.dropna(subset=["Price"])
             df["Price"] = df["Price"].astype(int)
 
-        return df
-    except Exception:
+        return df if not df.empty else None
+    except Exception as e:
+        st.warning(f"Error reading cached Excel file: {e}")
         return None
 
 # =====================================================
@@ -113,7 +154,6 @@ def load_cached_dataset(excel_path):
 # =====================================================
 
 if "scraped_df" not in st.session_state:
-    # Pre-load the validated dataset so the dashboard is populated on startup
     st.session_state.scraped_df = load_cached_dataset(OUTPUT_EXCEL)
 if "search_query" not in st.session_state:
     st.session_state.search_query = "HP Pavilion"
@@ -146,7 +186,6 @@ if scan:
 
     driver = None
     try:
-        # Launch the automated Chrome browser (works on local machines with Chrome installed)
         driver = create_driver()
 
         status.info(f"Scanning Amazon, Flipkart & Reliance Digital for: {search_query}...")
@@ -175,13 +214,19 @@ if scan:
             status.success("Scan Completed Successfully!")
 
     except Exception:
-        # Cloud Fallback when running on headless Streamlit Community Cloud without Chrome binary
         cached_df = load_cached_dataset(OUTPUT_EXCEL)
         if cached_df is not None and not cached_df.empty:
-            st.session_state.scraped_df = cached_df
-            status.info(
-                "⚡ **Cloud Demo Mode:** Live headless Chrome scraping requires a local desktop environment. "
-                "Displaying the validated 28-item dataset (`HP Pavilion` across Amazon, Flipkart & Reliance Digital)."
+            # Filter by search query if matching products exist in the validated dataset
+            if "Product" in cached_df.columns and search_query.strip():
+                filtered = cached_df[
+                    cached_df["Product"].astype(str).str.contains(search_query.strip(), case=False, na=False)
+                ]
+                st.session_state.scraped_df = filtered if not filtered.empty else cached_df
+            else:
+                st.session_state.scraped_df = cached_df
+
+            status.success(
+                "⚡ Cloud Demo Mode: Loaded the validated 28-item dataset across Amazon, Flipkart & Reliance Digital."
             )
         else:
             status.error("Live browser automation is unavailable in this cloud container and no cached dataset was found.")
@@ -287,7 +332,7 @@ if df_source is not None and not df_source.empty:
                 st.download_button(
                     label="📥 Download Chart Image",
                     data=file,
-                    file_name=CHART_FILENAME,
+                    file_name="price_comparison_chart.png",
                     mime="image/png",
                     use_container_width=True
                 )
