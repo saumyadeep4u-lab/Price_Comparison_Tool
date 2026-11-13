@@ -13,12 +13,16 @@ handles annoying popups, and scrolls down pages just like a real human would.
 # IMPORTS
 # ==========================================================
 
+import os
+import shutil
 import random
 import time
 
 # 'undetected_chromedriver' is a special version of Chrome that hides automated behavior
 import undetected_chromedriver as uc
 
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
@@ -42,6 +46,8 @@ from src.config import PAGE_LOAD_TIMEOUT
 class Browser:
     """
     Sets up and configures the automated web browser with stealth settings.
+    Supports both Local Desktop Chrome (via undetected_chromedriver) and
+    Linux Cloud Containers (via headless Chromium on Streamlit Cloud).
     """
 
     def __init__(self):
@@ -56,31 +62,78 @@ class Browser:
         """
         print("Booting Enterprise Stealth Chrome...")
 
-        options = uc.ChromeOptions()
-
-        # Window Settings: Open the browser fully maximized
-        options.add_argument("--start-maximized")
-
-        # Anti-Detection Settings: Turn off flags that tell websites "I am a robot"
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-infobars")
-        options.add_argument("--disable-popup-blocking")
-        options.add_argument("--disable-notifications")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--lang=en-IN")
-
-        # Better Rendering: Disable heavy graphical processing to speed up scraping
-        options.add_argument("--disable-gpu")
-
-        # Launch the custom stealth browser
-        self.driver = uc.Chrome(
-            options=options,
-            version_main=150,
-            use_subprocess=True
+        # Check if running on a Linux Cloud container (e.g., Streamlit Community Cloud)
+        chromium_path = (
+            shutil.which("chromium")
+            or shutil.which("chromium-browser")
+            or ("/usr/bin/chromium" if os.path.exists("/usr/bin/chromium") else None)
+        )
+        chromedriver_path = (
+            shutil.which("chromedriver")
+            or ("/usr/bin/chromedriver" if os.path.exists("/usr/bin/chromedriver") else None)
         )
 
-        self.driver.maximize_window()
+        # --------------------------------------------------
+        # MODE 1: STREAMLIT CLOUD (HEADLESS LINUX CHROMIUM)
+        # --------------------------------------------------
+        if chromium_path and chromedriver_path and os.name != "nt":
+            options = webdriver.ChromeOptions()
+            options.binary_location = chromium_path
+
+            # Headless Cloud Settings with full HD viewport for lazy-loaded elements
+            options.add_argument("--headless=new")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--disable-infobars")
+            options.add_argument("--disable-popup-blocking")
+            options.add_argument("--disable-notifications")
+            options.add_argument("--lang=en-IN")
+            options.add_argument(
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+
+            service = Service(executable_path=chromedriver_path)
+            self.driver = webdriver.Chrome(service=service, options=options)
+
+        # --------------------------------------------------
+        # MODE 2: LOCAL DESKTOP (UNDETECTED CHROMEDRIVER)
+        # --------------------------------------------------
+        else:
+            options = uc.ChromeOptions()
+
+            # Window Settings: Open the browser fully maximized
+            options.add_argument("--start-maximized")
+
+            # Anti-Detection Settings: Turn off flags that tell websites "I am a robot"
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--disable-infobars")
+            options.add_argument("--disable-popup-blocking")
+            options.add_argument("--disable-notifications")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--lang=en-IN")
+
+            # Better Rendering: Disable heavy graphical processing to speed up scraping
+            options.add_argument("--disable-gpu")
+
+            # Launch the custom stealth browser
+            self.driver = uc.Chrome(
+                options=options,
+                version_main=150,
+                use_subprocess=True
+            )
+
+            try:
+                self.driver.maximize_window()
+            except Exception:
+                pass
 
         # Set a hard time limit for how long the browser will wait for a page to load
         self.driver.set_page_load_timeout(
@@ -88,11 +141,14 @@ class Browser:
         )
 
         # Advanced Stealth: Hide the internal "webdriver" flag from the browser's system variables
-        self.driver.execute_script("""
+        try:
+            self.driver.execute_script("""
 Object.defineProperty(navigator,'webdriver',{
 get:()=>undefined
 });
 """)
+        except Exception:
+            pass
 
         return self.driver
 
