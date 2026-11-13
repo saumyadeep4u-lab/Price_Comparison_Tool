@@ -58,10 +58,36 @@ def parse_price_value(val):
     return None
 
 
+def sanitize_for_arrow(df):
+    """Ensures unique column names and strict types so PyArrow / st.dataframe never crashes."""
+    if df is None or df.empty:
+        return None
+
+    # 1. Remove any duplicate column names
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    # 2. Keep only the expected dashboard columns in clean order
+    expected_cols = ["Platform", "Product", "Price", "Discount", "Rating", "Rating Count", "URL"]
+    available_cols = [c for c in expected_cols if c in df.columns]
+    if available_cols:
+        df = df[available_cols].copy()
+
+    # 3. Enforce strict types for PyArrow compatibility
+    if "Price" in df.columns:
+        df["Price"] = df["Price"].apply(parse_price_value)
+        df = df.dropna(subset=["Price"])
+        df["Price"] = df["Price"].astype(int)
+
+    for col in df.columns:
+        if col != "Price":
+            df[col] = df[col].fillna("N/A").astype(str)
+
+    return df.reset_index(drop=True)
+
+
 def load_cached_dataset(excel_path):
     """Loads price_comparison.xlsx and extracts clean URLs from HYPERLINK formulas."""
     if not os.path.exists(excel_path):
-        # Fallback if running from a different working directory
         if os.path.exists("price_comparison.xlsx"):
             excel_path = "price_comparison.xlsx"
         else:
@@ -74,25 +100,13 @@ def load_cached_dataset(excel_path):
         if not rows:
             return None
 
-        # Automatically locate the header row within the first 10 rows
-        header_idx = 0
-        expected_keywords = {"platform", "product", "name", "title", "price", "discount", "rating", "review", "url", "link"}
-        best_matches = -1
-
-        for idx, row in enumerate(rows[:10]):
-            row_vals = [str(cell.value).strip().lower() for cell in row if cell.value is not None]
-            matches = sum(1 for val in row_vals if any(k in val for k in expected_keywords))
-            if matches > best_matches:
-                best_matches = matches
-                header_idx = idx
-
         headers = [
             str(cell.value).strip() if cell.value is not None else f"Col_{i}"
-            for i, cell in enumerate(rows[header_idx])
+            for i, cell in enumerate(rows[0])
         ]
 
         records = []
-        for row in rows[header_idx + 1:]:
+        for row in rows[1:]:
             if all(cell.value is None for cell in row):
                 continue
             record = {}
@@ -111,12 +125,12 @@ def load_cached_dataset(excel_path):
         if df.empty:
             return None
 
-        # Map columns in strict priority order without creating duplicate column names
-        rename_map = {}
+        # Map columns cleanly without collisions
+        new_columns = []
         used_targets = set()
 
-        for col in df.columns:
-            col_lower = col.lower()
+        for i, col in enumerate(df.columns):
+            col_lower = str(col).lower()
             target = None
             if ("url" in col_lower or "link" in col_lower) and "URL" not in used_targets:
                 target = "URL"
@@ -134,17 +148,13 @@ def load_cached_dataset(excel_path):
                 target = "Product"
 
             if target:
-                rename_map[col] = target
+                new_columns.append(target)
                 used_targets.add(target)
+            else:
+                new_columns.append(f"Extra_{i}")
 
-        df = df.rename(columns=rename_map)
-
-        if "Price" in df.columns:
-            df["Price"] = df["Price"].apply(parse_price_value)
-            df = df.dropna(subset=["Price"])
-            df["Price"] = df["Price"].astype(int)
-
-        return df if not df.empty else None
+        df.columns = new_columns
+        return sanitize_for_arrow(df)
     except Exception as e:
         st.warning(f"Error reading cached Excel file: {e}")
         return None
@@ -210,23 +220,15 @@ if scan:
                 "URL": p.url
             } for p in products]
 
-            st.session_state.scraped_df = pd.DataFrame(data)
+            st.session_state.scraped_df = sanitize_for_arrow(pd.DataFrame(data))
             status.success("Scan Completed Successfully!")
 
     except Exception:
         cached_df = load_cached_dataset(OUTPUT_EXCEL)
         if cached_df is not None and not cached_df.empty:
-            # Filter by search query if matching products exist in the validated dataset
-            if "Product" in cached_df.columns and search_query.strip():
-                filtered = cached_df[
-                    cached_df["Product"].astype(str).str.contains(search_query.strip(), case=False, na=False)
-                ]
-                st.session_state.scraped_df = filtered if not filtered.empty else cached_df
-            else:
-                st.session_state.scraped_df = cached_df
-
+            st.session_state.scraped_df = cached_df
             status.success(
-                "⚡ Cloud Demo Mode: Loaded the validated 28-item dataset across Amazon, Flipkart & Reliance Digital."
+                f"⚡ Cloud Demo Mode: Loaded the validated {len(cached_df)}-item dataset across Amazon, Flipkart & Reliance Digital."
             )
         else:
             status.error("Live browser automation is unavailable in this cloud container and no cached dataset was found.")
@@ -241,7 +243,7 @@ if scan:
 df_source = st.session_state.scraped_df
 
 if df_source is not None and not df_source.empty:
-    df = df_source.copy()
+    df = sanitize_for_arrow(df_source)
 
     st.divider()
     st.subheader("📊 Summary")
@@ -281,10 +283,12 @@ if df_source is not None and not df_source.empty:
         df = df.sort_values("Price", ascending=False)
     elif "Rating" in df.columns:
         df["Temp_Rating"] = pd.to_numeric(
-            df["Rating"].astype(str).str.replace("Unrated", "0", case=False),
+            df["Rating"].astype(str).str.extract(r"(\d+\.?\d*)")[0],
             errors="coerce"
         ).fillna(0)
         df = df.sort_values("Temp_Rating", ascending=False).drop(columns=["Temp_Rating"])
+
+    df = df.reset_index(drop=True)
 
     # -----------------------------------
     # DATAFRAME (THE DATA TABLE)
