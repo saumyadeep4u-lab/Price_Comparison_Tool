@@ -3,6 +3,7 @@
 An enterprise-grade, automated **Data Engineering and Web Scraping ETL pipeline** engineered to extract, clean, validate, and visualize live pricing data for consumer electronics ("HP Pavilion" laptops) across three major retail networks: **Amazon**, **Flipkart**, and **Reliance Digital**. Powered by stealth Selenium automation, regex-powered data cleaning, and an interactive **Streamlit** web dashboard.
 
 ---
+🌐 **Live Demo:** [View the Interactive Price Comparison Dashboard](https://pricecomparisontool.streamlit.app/)
 
 ## 🚀 Key Features
 - 🕵️‍♂️ **Stealth Web Scraping (`undetected_chromedriver`):** Bypasses aggressive bot-detection algorithms and anti-scraping firewalls using human-like randomized scrolling intervals and lazy-load navigation.
